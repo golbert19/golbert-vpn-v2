@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+LIB_DIR="/usr/local/lib/golbert-vpn"
+CONFIG_FILE="/usr/local/share/golbert-vpn/services.conf"
+if [[ -f "$ROOT_DIR/lib/common.sh" ]]; then LIB_DIR="$ROOT_DIR/lib"; CONFIG_FILE="$ROOT_DIR/config/services.conf"; fi
+source "$LIB_DIR/common.sh"
+source "$LIB_DIR/system.sh"
+source "$LIB_DIR/services.sh"
+source "$LIB_DIR/ports.sh"
+source "$LIB_DIR/users.sh"
+source "$LIB_DIR/firewall.sh"
+source "$LIB_DIR/backup.sh"
+source "$LIB_DIR/protocols.sh"
+
+clear_screen(){ printf '\033c'; }
+wait_key(){ read -r -p $'\nPresiona ENTER para continuar...' _ || true; }
+
+service_count(){
+  local n=0 s
+  for s in ssh dropbear stunnel4 openvpn xray squid; do service_exists "$s" && n=$((n+1)); done
+  printf '%s' "$n"
+}
+
+count_users(){ awk -F: '$3>=1000 && $1!="nobody" {n++} END{print n+0}' /etc/passwd; }
+
+connected_users(){
+  # Best-effort SSH session count; does not inspect application-level VPN sessions.
+  who 2>/dev/null | wc -l | tr -d ' '
+}
+
+status_word(){
+  local svc="$1"
+  case "$(service_state "$svc")" in
+    ON) printf '%bON%b' "$GREEN" "$RESET";;
+    OFF) printf '%bOFF%b' "$RED" "$RESET";;
+    *) printf '%bN/A%b' "$YELLOW" "$RESET";;
+  esac
+}
+
+print_header(){
+  local os up ip host disk cpu ram cores
+  os=$(os_name); up=$(uptime_human); ip=$(public_ip); host=$(host_name)
+  read -r total used free pct < <(disk_info)
+  cpu=$(cpu_usage); read -r usedram totalram availram < <(ram_info); cores=$(nproc 2>/dev/null || echo 1)
+  printf '%b╔══════════════════════════════════════════════════════════════════════════════════════╗%b\n' "$RED" "$RESET"
+  printf '%b║%b  📡  %bGOLBERT VPN%b  •  %bPANEL DE CONTROL VPS%b                         📡  %b║%b\n' "$RED" "$RESET" "$CYAN" "$RESET" "$WHITE" "$RESET" "$RED" "$RESET"
+  printf '%b║%b             %bConectividad  •  Seguridad  •  Administración%b                 %b║%b\n' "$RED" "$RESET" "$CYAN" "$RESET" "$RED" "$RESET"
+  printf '%b╠══════════════════════════════════════════════════════════════════════════════════════╣%b\n' "$RED" "$RESET"
+  printf '%bOS      :%b %-30s  %bUPTIME :%b %s\n' "$CYAN" "$RESET" "$os" "$CYAN" "$RESET" "$up"
+  printf '%bIP/DOM  :%b %-30s  %bHOST   :%b %s\n' "$CYAN" "$RESET" "$ip" "$CYAN" "$RESET" "$host"
+  printf '%bDISCO   :%b Total %-8s Uso %-8s Libre %-8s\n' "$CYAN" "$RESET" "$(format_bytes "$total")" "$(format_bytes "$used")" "$(format_bytes "$free")"
+  printf '%bCPU     :%b ' "$CYAN" "$RESET"; percent_bar "$cpu" 20; printf ' %5s%%  Cores: %s\n' "$cpu" "$cores"
+  printf '%bRAM     :%b ' "$CYAN" "$RESET"; local rp=$((usedram*100/totalram)); percent_bar "$rp" 20; printf ' %s/%s  Libre: %s\n' "$(format_bytes $((usedram*1024)))" "$(format_bytes $((totalram*1024)))" "$(format_bytes $((availram*1024)))"
+  printf '%b╠══════════════════════════════════════════════════════════════════════════════════════╣%b\n' "$RED" "$RESET"
+  printf '%bSERVICIOS:%b SSH:%s  DROPBEAR:%s  STUNNEL:%s  OPENVPN:%s  XRAY:%s  SQUID:%s\n' "$YELLOW" "$RESET" "$(status_word ssh)" "$(status_word dropbear)" "$(status_word stunnel4)" "$(status_word openvpn)" "$(status_word xray)" "$(status_word squid)"
+  printf '%bCUENTAS   :%b SSH:%-3s  Conectados:%-3s\n' "$YELLOW" "$RESET" "$(count_users)" "$(connected_users)"
+  printf '%b╠══════════════════════════════════════════════════════════════════════════════════════╣%b\n' "$RED" "$RESET"
+}
+
+print_menu(){
+  printf '%b  PROTOCOLOS                  REDES / TRANSPORTES             SERVICIOS ESPECIALES%b\n' "$CYAN" "$RESET"
+  printf '%b [01]%b VLESS                 %b[07]%b WebSocket                 %b[14]%b Dropbear (109)\n' "$GREEN" "$RESET" "$GREEN" "$RESET" "$GREEN" "$RESET"
+  printf '%b [02]%b VMess                 %b[08]%b HTTP Upgrade              %b[15]%b OpenSSH (22)\n' "$GREEN" "$RESET" "$GREEN" "$RESET" "$GREEN" "$RESET"
+  printf '%b [03]%b Trojan                %b[09]%b XHTTP                     %b[16]%b OpenVPN (1194,2200)\n' "$GREEN" "$RESET" "$GREEN" "$RESET" "$GREEN" "$RESET"
+  printf '%b [04]%b SSH                   %b[10]%b OHP (8282,8383)           %b[17]%b HCR (8181)\n' "$GREEN" "$RESET" "$GREEN" "$RESET" "$GREEN" "$RESET"
+  printf '%b [05]%b OpenVPN               %b[11]%b Squid (3128)              %b[18]%b SlowDNS (5300,53)\n' "$GREEN" "$RESET" "$GREEN" "$RESET" "$GREEN" "$RESET"
+  printf '%b [06]%b UDP Custom             %b[12]%b BHTTP (8080)              %b[19]%b UDP Custom (1-65535)\n' "$GREEN" "$RESET" "$GREEN" "$RESET" "$GREEN" "$RESET"
+  printf '                              %b[13]%b BTUN (8888)\n' "$GREEN" "$RESET"
+  printf '%b╠══════════════════════════════════════════════════════════════════════════════════════╣%b\n' "$RED" "$RESET"
+  printf '%b [20]%b Estado de servicios       %b[21]%b Puertos escuchando         %b[22]%b Usuarios\n' "$GREEN" "$RESET" "$GREEN" "$RESET" "$GREEN" "$RESET"
+  printf '%b [23]%b Firewall seguro           %b[24]%b Backup                     %b[25]%b Diagnóstico\n' "$GREEN" "$RESET" "$GREEN" "$RESET" "$GREEN" "$RESET"
+  printf '%b [26]%b Logs                      %b[27]%b Reiniciar servicios        %b[28]%b Actualizar panel\n' "$GREEN" "$RESET" "$GREEN" "$RESET" "$GREEN" "$RESET"
+  printf '%b [0]%b Salir\n' "$GREEN" "$RESET"
+  printf '%b══════════════════════════════════════════════════════════════════════════════════════%b\n' "$RED" "$RESET"
+  printf '%bVersión: %s%b\n' "$YELLOW" "$VERSION" "$RESET"
+}
+
+service_menu(){
+  printf '\n%bESTADO DE SERVICIOS%b\n' "$CYAN" "$RESET"
+  local s; for s in ssh dropbear stunnel4 openvpn xray squid; do printf '  %-12s %s\n' "$s" "$(status_word "$s")"; done
+  printf '\nAcción: [start|stop|restart|status|logs] servicio, o ENTER para volver\n'
+  read -r -p '> ' cmd svc
+  [[ -z "${cmd:-}" ]] || service_action "$cmd" "$svc"
+}
+
+port_menu(){
+  printf '\n%bPUERTOS ESCUCHANDO%b\n' "$CYAN" "$RESET"
+  show_listeners | head -80 || true
+  printf '\n%bPuertos definidos por Golbert%b\n' "$CYAN" "$RESET"
+  awk -F'|' 'NR>1{printf "%-18s %-8s %-14s %s\n",$1,$2,$3,$4}' "$CONFIG_FILE"
+}
+
+diagnostic(){
+  printf '\n%bGOLBERT DIAGNÓSTICO%b\n' "$CYAN" "$RESET"
+  local checks=("OpenSSH:sshd:22:TCP" "Dropbear:dropbear:109:TCP" "WebSocket:ws-proxy.py:80:TCP" "TLS:stunnel4:443:TCP" "OpenVPN:openvpn:1194:TCP" "Squid:squid:3128:TCP")
+  local item name proc port proto state
+  for item in "${checks[@]}"; do IFS=: read -r name proc port proto <<< "$item"; if port_listening "$proto" "$port"; then state="${GREEN}OK${RESET}"; else state="${RED}OFF${RESET}"; fi; printf '%-14s %-8s %s\n' "$name" "$port/$proto" "$state"; done
+  printf '\nFirewall: '; command_exists ufw && ufw status | head -1 || printf 'no instalado\n'
+  printf 'Systemd: '; has_systemd && echo OK || echo NO
+}
+
+users_menu(){
+  printf '\n%bUSUARIOS%b\n' "$CYAN" "$RESET"; list_users
+  printf '\n[1] Crear  [2] Eliminar  [0] Volver\n'; read -r -p '> ' a
+  case "$a" in 1) create_user;; 2) delete_user;; esac
+}
+
+backup_menu(){
+  printf '\n[1] Crear backup  [2] Listar backups  [0] Volver\n'; read -r -p '> ' a
+  case "$a" in 1) create_backup;; 2) list_backups;; esac
+}
+
+run(){
+  require_root; init_dirs
+  while true; do
+    clear_screen; print_header; print_menu
+    read -r -p $'\nSeleccione una opción: ' op
+    case "$op" in
+      1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19) info "La opción $op está definida en el inventario. La instalación del backend se mantiene separada para evitar sobrescribir configuraciones existentes."; wait_key;;
+      20) clear_screen; service_menu; wait_key;;
+      21) clear_screen; port_menu; wait_key;;
+      22) clear_screen; users_menu; wait_key;;
+      23) clear_screen; firewall_status; read -r -p '¿Aplicar reglas base seguras? [s/N] ' x; [[ "$x" =~ ^[sS]$ ]] && firewall_apply_safe; wait_key;;
+      24) clear_screen; backup_menu; wait_key;;
+      25) clear_screen; diagnostic; wait_key;;
+      26) clear_screen; tail -100 "$LOG_DIR/panel.log" 2>/dev/null || true; wait_key;;
+      27) clear_screen; restart_known ssh dropbear stunnel4 openvpn xray squid; ok 'Reinicio solicitado.'; wait_key;;
+      28) info 'Para actualizar: git pull && ./install.sh'; wait_key;;
+      0|x|X) clear_screen; exit 0;;
+      *) warn 'Opción no válida.'; sleep 1;;
+    esac
+  done
+}
+
+case "${1:-}" in
+  doctor) diagnostic;;
+  ports) show_listeners;;
+  users) list_users;;
+  backup) create_backup;;
+  service) service_action "${2:-status}" "${3:-ssh}";;
+  *) run;;
+esac
